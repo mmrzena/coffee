@@ -18,149 +18,39 @@ private let durationOptions: [(label: String, minutes: Int)] = [
 	("On for 30 min", 30), ("On for 1 hour", 60), ("On for 2 hours", 120), ("On for 4 hours", 240),
 ]
 
-/// The menu-bar icon: a cup, plus wisps of steam that rise and fade while Coffee is on.
-/// Lives on top of the status-bar button and ignores clicks so the button still gets them.
-private final class CoffeeIconView: NSView {
-	private let cupView = NSImageView()
-	private let wisps = (0..<3).map { _ in CAShapeLayer() }
-	private let cupConfig = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
-	/// Average seconds for one wisp to rise and fade (each puff varies ±25%).
-	private let steamCycle: CFTimeInterval = 4.5
-	/// Seconds of no steam between bursts.
-	private let quietPause: ClosedRange<Double> = 8...15
-	private let wispSpacing: CGFloat = 3
-	private var generation = 0
-
-	var isSteaming = false {
-		didSet { if isSteaming != oldValue { update() } }
+/// The outline steaming cup with the steam removed. SF Symbols has no steam-free version of this
+/// cup, so this hides the symbol's steam layer and redraws the stretch of rim that Apple cuts
+/// away where the steam crosses it. Rim geometry is measured from the symbol, in points of its
+/// 17×16 default size.
+private func makeCupWithoutSteam() -> NSImage? {
+	guard let cup = NSImage(systemSymbolName: "cup.and.heat.waves", accessibilityDescription: "Coffee off")?
+		.withSymbolConfiguration(.init(paletteColors: [.black, .black, .clear])) // layer 3 = steam
+	else { return nil }
+	let image = NSImage(size: cup.size, flipped: true) { rect in
+		cup.draw(in: rect)
+		let scale = rect.width / 17
+		NSGraphicsContext.saveGraphicsState()
+		NSRect(x: 4 * scale, y: 4.5 * scale, width: 7 * scale, height: 2.5 * scale).clip() // top of rim only
+		let rimRadius = NSSize(width: 5.075 * scale, height: 1.795 * scale)
+		let rim = NSBezierPath(ovalIn: NSRect(x: 7.5 * scale - rimRadius.width, y: 7.56 * scale - rimRadius.height,
+			width: 2 * rimRadius.width, height: 2 * rimRadius.height))
+		rim.lineWidth = 1.05 * scale
+		NSColor.black.setStroke()
+		rim.stroke()
+		NSGraphicsContext.restoreGraphicsState()
+		return true
 	}
-
-	override init(frame: NSRect) {
-		super.init(frame: frame)
-		wantsLayer = true
-		cupView.imageScaling = .scaleNone
-		addSubview(cupView)
-		for wisp in wisps {
-			wisp.fillColor = nil
-			wisp.lineWidth = 1.2
-			wisp.lineCap = .round
-			wisp.opacity = 0
-			// No implicit 0.25s fades: they made the wisps flash on toggle. Only the explicit
-			// puff animations should move them.
-			wisp.actions = ["opacity": NSNull(), "path": NSNull(), "position": NSNull(),
-				"bounds": NSNull(), "strokeColor": NSNull()]
-			layer?.addSublayer(wisp)
-		}
-		update()
-	}
-
-	required init?(coder: NSCoder) { fatalError("not used") }
-
-	override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-	// Hand-added sublayers stay at 1x unless told otherwise, which blurs the thin strokes on Retina.
-	override func viewDidChangeBackingProperties() {
-		super.viewDidChangeBackingProperties()
-		let scale = window?.backingScaleFactor ?? 2
-		for wisp in wisps { wisp.contentsScale = scale }
-	}
-
-	override func layout() {
-		super.layout()
-		let cupSize = cupView.image?.size ?? .zero
-		// Nudged 1pt right so the cup looks centred in the menu-bar highlight; sits low so the
-		// rising steam stays inside it.
-		let offsetX: CGFloat = 1
-		cupView.frame = NSRect(x: offsetX, y: 0, width: bounds.width, height: cupSize.height)
-
-		// The cup's opening sits a little left of centre (the handle is on the right).
-		let rimY = cupView.frame.maxY + 1
-		let height = max(3, min(6, bounds.height - rimY - 1))
-		let centerX = bounds.midX - 0.5 + offsetX
-		for (index, wisp) in wisps.enumerated() {
-			let x = centerX + CGFloat(index - 1) * wispSpacing
-			let path = CGMutablePath()
-			path.move(to: CGPoint(x: x, y: rimY))
-			path.addCurve(to: CGPoint(x: x, y: rimY + height),
-				control1: CGPoint(x: x + 1.5, y: rimY + height / 3),
-				control2: CGPoint(x: x - 1.5, y: rimY + height * 2 / 3))
-			wisp.path = path
-			wisp.frame = bounds
-		}
-	}
-
-	override func viewDidChangeEffectiveAppearance() {
-		super.viewDidChangeEffectiveAppearance()
-		updateColors()
-	}
-
-	private func update() {
-		let symbol = isSteaming ? "cup.and.saucer.fill" : "cup.and.saucer"
-		cupView.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-			.withSymbolConfiguration(cupConfig)
-		updateColors()
-		needsLayout = true
-
-		generation += 1 // stops any burst loop from the previous state
-		let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-		for wisp in wisps {
-			wisp.removeAllAnimations()
-			wisp.opacity = isSteaming && reduceMotion ? 0.7 : 0 // Reduce Motion: static steam
-		}
-		guard isSteaming, !reduceMotion else { return }
-		steamEpisode(generation: generation) // right away, as feedback for the click
-	}
-
-	/// A short burst of steam (one random puff per wisp), followed by a quiet pause, then
-	/// another burst. Catches the eye now and then without moving constantly.
-	private func steamEpisode(generation: Int) {
-		guard generation == self.generation else { return } // Coffee was toggled since
-		let pause = Double.random(in: quietPause)
-		let scheduleNext = { [weak self] in
-			DispatchQueue.main.asyncAfter(deadline: .now() + pause) {
-				self?.steamEpisode(generation: generation)
-			}
-		}
-		// Skip the burst while nobody can see it (display asleep, menu bar hidden).
-		guard window?.occlusionState.contains(.visible) == true else { return scheduleNext() }
-
-		CATransaction.begin()
-		CATransaction.setCompletionBlock(scheduleNext)
-		for wisp in wisps {
-			wisp.add(puff(delay: .random(in: 0...1.5)), forKey: nil)
-		}
-		CATransaction.commit()
-	}
-
-	/// One puff: the wisp drifts up (and a little sideways) while fading in and out, with
-	/// random timing, height, drift and strength so the wisps never fall into a fixed sequence.
-	private func puff(delay: CFTimeInterval) -> CAAnimation {
-		let rise = CABasicAnimation(keyPath: "transform.translation") // up, drifting sideways
-		rise.fromValue = NSValue(size: NSSize(width: 0, height: -1))
-		rise.toValue = NSValue(size: NSSize(width: .random(in: -0.8...0.8), height: .random(in: 2.5...3.5)))
-		let fade = CAKeyframeAnimation(keyPath: "opacity")
-		fade.values = [0, Double.random(in: 0.55...0.9), 0]
-		fade.keyTimes = [0, NSNumber(value: Double.random(in: 0.25...0.45)), 1]
-
-		let group = CAAnimationGroup()
-		group.animations = [rise, fade]
-		group.duration = steamCycle * .random(in: 0.75...1.25)
-		group.beginTime = CACurrentMediaTime() + delay
-		group.timingFunction = CAMediaTimingFunction(name: .easeOut)
-		return group
-	}
-
-	private func updateColors() {
-		effectiveAppearance.performAsCurrentDrawingAppearance {
-			let color = NSColor.labelColor.cgColor
-			for wisp in wisps { wisp.strokeColor = color }
-		}
-	}
+	image.isTemplate = true
+	image.alignmentRect = cup.alignmentRect // sit in the menu bar exactly like the "on" symbol
+	image.accessibilityDescription = "Coffee off"
+	return image
 }
+
+private let offIcon = makeCupWithoutSteam()
+	?? NSImage(systemSymbolName: "cup.and.saucer", accessibilityDescription: "Coffee off")
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 	private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-	private let iconView = CoffeeIconView()
 	private var session: Session?
 	private var lastError: String?
 	private var keepDisplayOn = UserDefaults.standard.bool(forKey: DefaultsKey.keepDisplayOn)
@@ -172,9 +62,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			button.target = self
 			button.action = #selector(clicked)
 			button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-			iconView.frame = button.bounds
-			iconView.autoresizingMask = [.width, .height]
-			button.addSubview(iconView)
 		}
 		// Timers don't count time spent asleep, so re-check the real clock on wake.
 		NSWorkspace.shared.notificationCenter.addObserver(
@@ -293,9 +180,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	}
 
 	private func refresh() {
+		// On: filled steaming cup. Off: the same cup in outline, without the steam. macOS 14+ has
+		// the steaming-cup symbol; older systems fall back to the cup and saucer.
+		statusItem.button?.image = isOn
+			? NSImage(systemSymbolName: "cup.and.heat.waves.fill", accessibilityDescription: "Coffee on")
+				?? NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: "Coffee on")
+			: offIcon
 		statusItem.button?.toolTip = statusText() + "\nClick to toggle · right-click for options"
-		statusItem.button?.setAccessibilityLabel(isOn ? "Coffee on" : "Coffee off")
-		iconView.isSteaming = isOn
 	}
 }
 
