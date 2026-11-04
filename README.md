@@ -14,7 +14,7 @@ This builds a universal app into `~/Applications/Coffee.app` and launches it. Ru
 
 ## Use
 
-A coffee cup icon appears in the menu bar. A filled cup means the Mac is being kept awake.
+A coffee cup icon appears in the menu bar. A filled cup means the Mac is being kept awake; while it's on, a few wisps of steam rise from the cup every so often (static steam if Reduce Motion is enabled).
 
 - **Left-click** turns it on or off.
 - **Right-click** (or Ctrl-click) opens the menu:
