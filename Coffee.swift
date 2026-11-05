@@ -12,6 +12,7 @@ private struct Session {
 
 private enum DefaultsKey {
 	static let keepDisplayOn = "keepDisplayOn"
+	static let askBeforeToggling = "askBeforeToggling"
 	static let scheduleEnabled = "scheduleEnabled"
 	static let scheduleStartHour = "scheduleStartHour"
 	static let scheduleEndHour = "scheduleEndHour"
@@ -148,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	private var session: Session?
 	private var lastError: String?
 	private var keepDisplayOn = UserDefaults.standard.bool(forKey: DefaultsKey.keepDisplayOn)
+	private var askBeforeToggling = UserDefaults.standard.object(forKey: DefaultsKey.askBeforeToggling) as? Bool ?? true
 	private var schedule = Schedule.load()
 	private var scheduleTimer: Timer?
 	/// End of the scheduled window the user turned off by hand; the schedule leaves that window alone.
@@ -183,16 +185,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 	func applicationWillTerminate(_ notification: Notification) { turnOff() }
 
-	// Left click toggles; right click (or ctrl-click) opens the menu.
+	// Left click toggles or asks first; right click (or ctrl-click) opens the menu.
 	@objc private func clicked() {
 		let event = NSApp.currentEvent
 		if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
-			statusItem.menu = buildMenu()
-			statusItem.button?.performClick(nil)
-			statusItem.menu = nil
+			showMenu(buildMenu())
+		} else if askBeforeToggling {
+			showMenu(buildConfirmMenu())
 		} else {
 			isOn ? userTurnOff() : userTurnOn()
 		}
+	}
+
+	/// Pops `menu` up directly under the icon.
+	private func showMenu(_ menu: NSMenu) {
+		statusItem.menu = menu
+		statusItem.button?.performClick(nil)
+		statusItem.menu = nil
+	}
+
+	/// A short menu under the icon, so confirming is a click just below where you clicked.
+	private func buildConfirmMenu() -> NSMenu {
+		let menu = NSMenu()
+		if isOn {
+			menu.addItem(menuItem("Turn Off", #selector(userTurnOff)))
+		} else {
+			menu.addItem(menuItem("Turn On", #selector(confirmTurnOn)))
+			if !schedule.isEnabled || isSkippingCurrentWindow {
+				menu.addItem(menuItem("Turn On Schedule", #selector(confirmTurnOnSchedule)))
+			}
+		}
+		return menu
+	}
+
+	// Timers keep running while the menu is open, so act on what was offered, not a fresh toggle.
+	@objc private func confirmTurnOn() {
+		guard !isOn else { return }
+		dismissedWindowEnd = nil
+		turnOn(until: nil)
+	}
+
+	/// Enables the schedule, or stops skipping today's window; Coffee comes on now if it's within hours.
+	@objc private func confirmTurnOnSchedule() {
+		dismissedWindowEnd = nil
+		updateSchedule { $0.isEnabled = true }
 	}
 
 	private func buildMenu() -> NSMenu {
@@ -211,6 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		menu.addItem(.separator())
 		menu.addItem(menuItem("Keep Display On", #selector(toggleKeepDisplayOn), checked: keepDisplayOn))
 		menu.addItem(scheduleMenuItem())
+		menu.addItem(menuItem("Ask Before Toggling", #selector(toggleAskBeforeToggling), checked: askBeforeToggling))
 		menu.addItem(.separator())
 		menu.addItem(menuItem("Quit Coffee", #selector(quit)))
 		return menu
@@ -281,6 +318,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		if let session { turnOn(until: session.until) } // re-assert with the new type, same end time
 	}
 
+	@objc private func toggleAskBeforeToggling() {
+		askBeforeToggling.toggle()
+		UserDefaults.standard.set(askBeforeToggling, forKey: DefaultsKey.askBeforeToggling)
+	}
+
 	@objc private func toggleSchedule() { updateSchedule { $0.isEnabled.toggle() } }
 	@objc private func toggleScheduleWeekdaysOnly() { updateSchedule { $0.weekdaysOnly.toggle() } }
 	@objc private func setScheduleStart(_ sender: NSMenuItem) { updateSchedule { $0.startHour = sender.tag } }
@@ -326,6 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 	/// Turning off by hand during scheduled hours skips the rest of that window.
 	@objc private func userTurnOff() {
+		guard isOn else { return } // a timer may have turned it off while a menu was open
 		dismissedWindowEnd = currentWindow?.end
 		turnOff()
 	}
@@ -397,7 +440,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 	private func refresh() {
 		statusItem.button?.image = currentIcon
-		statusItem.button?.toolTip = statusText() + "\nClick to toggle · right-click for options"
+		let click = askBeforeToggling ? "Click for on/off" : "Click to toggle"
+		statusItem.button?.toolTip = statusText() + "\n\(click) · right-click for options"
 	}
 }
 
