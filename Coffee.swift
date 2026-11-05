@@ -12,6 +12,71 @@ private struct Session {
 
 private enum DefaultsKey {
 	static let keepDisplayOn = "keepDisplayOn"
+	static let scheduleEnabled = "scheduleEnabled"
+	static let scheduleStartHour = "scheduleStartHour"
+	static let scheduleEndHour = "scheduleEndHour"
+	static let scheduleWeekdaysOnly = "scheduleWeekdaysOnly"
+}
+
+/// Daily keep-awake hours, e.g. 9:00–17:00 on weekdays. Windows start and end on whole hours
+/// within one day (startHour < endHour).
+private struct Schedule {
+	var isEnabled: Bool
+	var startHour: Int
+	var endHour: Int
+	var weekdaysOnly: Bool
+
+	static func load() -> Schedule {
+		let defaults = UserDefaults.standard
+		return Schedule(
+			isEnabled: defaults.bool(forKey: DefaultsKey.scheduleEnabled),
+			startHour: defaults.object(forKey: DefaultsKey.scheduleStartHour) as? Int ?? 9,
+			endHour: defaults.object(forKey: DefaultsKey.scheduleEndHour) as? Int ?? 17,
+			weekdaysOnly: defaults.object(forKey: DefaultsKey.scheduleWeekdaysOnly) as? Bool ?? true)
+	}
+
+	func save() {
+		let defaults = UserDefaults.standard
+		defaults.set(isEnabled, forKey: DefaultsKey.scheduleEnabled)
+		defaults.set(startHour, forKey: DefaultsKey.scheduleStartHour)
+		defaults.set(endHour, forKey: DefaultsKey.scheduleEndHour)
+		defaults.set(weekdaysOnly, forKey: DefaultsKey.scheduleWeekdaysOnly)
+	}
+
+	/// The scheduled window on the day containing `date`, or nil if that day isn't scheduled.
+	private func window(onDayOf date: Date, calendar: Calendar) -> DateInterval? {
+		if weekdaysOnly && calendar.isDateInWeekend(date) { return nil }
+		guard let start = calendar.date(bySettingHour: startHour, minute: 0, second: 0, of: date),
+			let end = calendar.date(bySettingHour: endHour, minute: 0, second: 0, of: date),
+			start < end
+		else { return nil }
+		return DateInterval(start: start, end: end)
+	}
+
+	/// The window `now` falls inside, if the schedule is on and `now` is within scheduled hours.
+	func activeWindow(at now: Date) -> DateInterval? {
+		guard isEnabled, let window = window(onDayOf: now, calendar: .current),
+			window.start <= now, now < window.end
+		else { return nil }
+		return window
+	}
+
+	func nextStart(after now: Date) -> Date? {
+		guard isEnabled else { return nil }
+		let calendar = Calendar.current
+		for dayOffset in 0...7 {
+			if let day = calendar.date(byAdding: .day, value: dayOffset, to: now),
+				let window = window(onDayOf: day, calendar: calendar), window.start > now {
+				return window.start
+			}
+		}
+		return nil
+	}
+}
+
+private func hourLabel(_ hour: Int) -> String {
+	let date = Calendar.current.date(bySettingHour: hour, minute: 0, second: 0, of: Date()) ?? Date()
+	return date.formatted(date: .omitted, time: .shortened)
 }
 
 private let durationOptions: [(label: String, minutes: Int)] = [
@@ -49,13 +114,56 @@ private func makeCupWithoutSteam() -> NSImage? {
 private let offIcon = makeCupWithoutSteam()
 	?? NSImage(systemSymbolName: "cup.and.saucer", accessibilityDescription: "Coffee off")
 
+// macOS 14+ has the steaming-cup symbol; older systems fall back to the cup and saucer.
+private let onIcon = NSImage(systemSymbolName: "cup.and.heat.waves.fill", accessibilityDescription: "Coffee on")
+	?? NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: "Coffee on")
+
+/// The "on" cup with a small clock in the bottom-right corner, shown while the schedule holds
+/// Coffee on. A ring around the clock is punched out of the cup so the badge reads at menu-bar size.
+private func makeScheduledIcon() -> NSImage? {
+	guard let cup = onIcon,
+		let clock = NSImage(systemSymbolName: "clock.fill", accessibilityDescription: nil)
+	else { return nil }
+	let image = NSImage(size: cup.size, flipped: false) { rect in
+		cup.draw(in: rect)
+		let side = rect.height * 0.6
+		let badge = NSRect(x: rect.maxX - side, y: rect.minY, width: side, height: side)
+		let gap = side * 0.15
+		NSGraphicsContext.current?.compositingOperation = .destinationOut
+		NSBezierPath(ovalIn: badge.insetBy(dx: -gap, dy: -gap)).fill()
+		NSGraphicsContext.current?.compositingOperation = .sourceOver
+		clock.draw(in: badge)
+		return true
+	}
+	image.isTemplate = true
+	image.alignmentRect = cup.alignmentRect
+	image.accessibilityDescription = "Coffee on by schedule"
+	return image
+}
+
+private let scheduledIcon = makeScheduledIcon() ?? onIcon
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
 	private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 	private var session: Session?
 	private var lastError: String?
 	private var keepDisplayOn = UserDefaults.standard.bool(forKey: DefaultsKey.keepDisplayOn)
+	private var schedule = Schedule.load()
+	private var scheduleTimer: Timer?
+	/// End of the scheduled window the user turned off by hand; the schedule leaves that window alone.
+	private var dismissedWindowEnd: Date?
 
 	private var isOn: Bool { session != nil }
+	/// On, and ending exactly when the current scheduled window does — i.e. the schedule's session.
+	private var isOnBySchedule: Bool {
+		guard let until = session?.until else { return false }
+		return until == currentWindow?.end
+	}
+	private var currentWindow: DateInterval? { schedule.activeWindow(at: Date()) }
+	private var isSkippingCurrentWindow: Bool {
+		guard let end = currentWindow?.end else { return false }
+		return end == dismissedWindowEnd
+	}
 
 	func applicationDidFinishLaunching(_ notification: Notification) {
 		if let button = statusItem.button {
@@ -63,9 +171,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			button.action = #selector(clicked)
 			button.sendAction(on: [.leftMouseUp, .rightMouseUp])
 		}
-		// Timers don't count time spent asleep, so re-check the real clock on wake.
+		// Timers don't count time spent asleep, so re-check the real clock on wake and clock changes.
 		NSWorkspace.shared.notificationCenter.addObserver(
-			self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
+			self, selector: #selector(recheckClock), name: NSWorkspace.didWakeNotification, object: nil)
+		for name in [Notification.Name.NSSystemClockDidChange, .NSSystemTimeZoneDidChange] {
+			NotificationCenter.default.addObserver(self, selector: #selector(recheckClock), name: name, object: nil)
+		}
+		applySchedule()
 		refresh()
 	}
 
@@ -79,7 +191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			statusItem.button?.performClick(nil)
 			statusItem.menu = nil
 		} else {
-			isOn ? turnOff() : turnOn(until: nil)
+			isOn ? userTurnOff() : userTurnOn()
 		}
 	}
 
@@ -90,27 +202,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		menu.addItem(status)
 		menu.addItem(.separator())
 		if isOn {
-			menu.addItem(menuItem("Turn Off", #selector(turnOff)))
+			menu.addItem(menuItem("Turn Off", #selector(userTurnOff)))
 		}
 		menu.addItem(menuItem("On Indefinitely", #selector(turnOnIndefinitely)))
 		for option in durationOptions {
-			let durationItem = menuItem(option.label, #selector(turnOnForDuration(_:)))
-			durationItem.tag = option.minutes
-			menu.addItem(durationItem)
+			menu.addItem(menuItem(option.label, #selector(turnOnForDuration(_:)), tag: option.minutes))
 		}
 		menu.addItem(.separator())
-		let displayItem = menuItem("Keep Display On", #selector(toggleKeepDisplayOn))
-		displayItem.state = keepDisplayOn ? .on : .off
-		menu.addItem(displayItem)
+		menu.addItem(menuItem("Keep Display On", #selector(toggleKeepDisplayOn), checked: keepDisplayOn))
+		menu.addItem(scheduleMenuItem())
 		menu.addItem(.separator())
 		menu.addItem(menuItem("Quit Coffee", #selector(quit)))
 		return menu
 	}
 
-	private func menuItem(_ title: String, _ action: Selector) -> NSMenuItem {
+	private func scheduleMenuItem() -> NSMenuItem {
+		let hours = "\(hourLabel(schedule.startHour))–\(hourLabel(schedule.endHour))"
+		let title: String
+		if !schedule.isEnabled {
+			title = "Schedule: Off"
+		} else if isSkippingCurrentWindow {
+			title = "Schedule: \(hours) (skipped today)"
+		} else {
+			title = "Schedule: \(hours)"
+		}
+		let submenu = NSMenu()
+		submenu.addItem(menuItem("On \(hours)", #selector(toggleSchedule), checked: schedule.isEnabled))
+		submenu.addItem(menuItem("Weekdays Only", #selector(toggleScheduleWeekdaysOnly), checked: schedule.weekdaysOnly))
+		submenu.addItem(.separator())
+		submenu.addItem(hourPicker("Start", selected: schedule.startHour,
+			enabled: 0...(schedule.endHour - 1), action: #selector(setScheduleStart(_:))))
+		submenu.addItem(hourPicker("End", selected: schedule.endHour,
+			enabled: (schedule.startHour + 1)...23, action: #selector(setScheduleEnd(_:))))
+		return submenuItem(title, submenu)
+	}
+
+	private func hourPicker(_ title: String, selected: Int, enabled: ClosedRange<Int>, action: Selector) -> NSMenuItem {
+		let submenu = NSMenu()
+		submenu.autoenablesItems = false // so hours that would make an empty window can be greyed out
+		for hour in 0...23 {
+			let hourItem = menuItem(hourLabel(hour), action, tag: hour, checked: hour == selected)
+			hourItem.isEnabled = enabled.contains(hour)
+			submenu.addItem(hourItem)
+		}
+		return submenuItem("\(title): \(hourLabel(selected))", submenu)
+	}
+
+	private func menuItem(_ title: String, _ action: Selector, tag: Int = 0, checked: Bool = false) -> NSMenuItem {
 		let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
 		item.target = self
+		item.tag = tag
+		item.state = checked ? .on : .off
 		return item
+	}
+
+	private func submenuItem(_ title: String, _ submenu: NSMenu) -> NSMenuItem {
+		let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+		item.submenu = submenu
+		return item
+	}
+
+	/// A one-shot timer in `.common` mode, so it still fires while a menu is open.
+	private func oneShotTimer(at date: Date, _ block: @escaping () -> Void) -> Timer {
+		let timer = Timer(fire: date, interval: 0, repeats: false) { _ in block() }
+		RunLoop.main.add(timer, forMode: .common)
+		return timer
 	}
 
 	@objc private func turnOnIndefinitely() { turnOn(until: nil) }
@@ -125,8 +281,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		if let session { turnOn(until: session.until) } // re-assert with the new type, same end time
 	}
 
-	@objc private func didWake() {
+	@objc private func toggleSchedule() { updateSchedule { $0.isEnabled.toggle() } }
+	@objc private func toggleScheduleWeekdaysOnly() { updateSchedule { $0.weekdaysOnly.toggle() } }
+	@objc private func setScheduleStart(_ sender: NSMenuItem) { updateSchedule { $0.startHour = sender.tag } }
+	@objc private func setScheduleEnd(_ sender: NSMenuItem) { updateSchedule { $0.endHour = sender.tag } }
+
+	private func updateSchedule(_ change: (inout Schedule) -> Void) {
+		let wasSkipping = isSkippingCurrentWindow
+		let oldWindowEnd = currentWindow?.end
+		change(&schedule)
+		schedule.save()
+		let newWindowEnd = currentWindow?.end
+		// Skipping today survives a settings edit: carry the skip over to the edited window.
+		dismissedWindowEnd = wasSkipping ? newWindowEnd : nil
+		// A session the old schedule started follows the new one: moved end, or off if outside it.
+		if let oldWindowEnd, session?.until == oldWindowEnd, newWindowEnd != oldWindowEnd {
+			if let newWindowEnd { turnOn(until: newWindowEnd) } else { turnOff() }
+		}
+		applySchedule()
+		refresh()
+	}
+
+	/// During scheduled hours, keeps Coffee on until the window ends (an indefinite or longer
+	/// session is left alone), then arms a timer for the next window's start.
+	private func applySchedule() {
+		scheduleTimer?.invalidate()
+		scheduleTimer = nil
+		let now = Date()
+		if let window = schedule.activeWindow(at: now), !isSkippingCurrentWindow {
+			let sessionEnd = session.map { $0.until ?? .distantFuture } ?? .distantPast
+			if sessionEnd < window.end { turnOn(until: window.end) }
+		}
+		if let next = schedule.nextStart(after: now) {
+			scheduleTimer = oneShotTimer(at: next) { [weak self] in self?.applySchedule() }
+		}
+	}
+
+	/// Clicking on during scheduled hours hands back to the schedule (on until the window ends);
+	/// outside them it's on until turned off.
+	private func userTurnOn() {
+		dismissedWindowEnd = nil
+		turnOn(until: currentWindow?.end)
+	}
+
+	/// Turning off by hand during scheduled hours skips the rest of that window.
+	@objc private func userTurnOff() {
+		dismissedWindowEnd = currentWindow?.end
+		turnOff()
+	}
+
+	@objc private func recheckClock() {
 		if let until = session?.until, until <= Date() { turnOff() }
+		applySchedule()
 	}
 
 	/// Starts (or replaces) a session. `until == nil` means indefinitely; an end time
@@ -147,9 +353,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 		var timer: Timer?
 		if let until {
-			let endTimer = Timer(fire: until, interval: 0, repeats: false) { [weak self] _ in self?.turnOff() }
-			RunLoop.main.add(endTimer, forMode: .common) // .common: keeps running while a menu is open
-			timer = endTimer
+			timer = oneShotTimer(at: until) { [weak self] in
+				self?.turnOff()
+				self?.applySchedule() // a short session ending inside scheduled hours hands back to the schedule
+			}
 		}
 
 		// New assertion exists before the old one is released, so there's no gap with nothing held.
@@ -174,18 +381,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 	private func statusText() -> String {
 		if let lastError { return lastError }
-		guard let session else { return "Off — Mac sleeps normally" }
+		guard let session else {
+			guard let next = schedule.nextStart(after: Date()) else { return "Off — Mac sleeps normally" }
+			return "Off — schedule resumes \(next.formatted(.dateTime.weekday().hour().minute()))"
+		}
 		guard let until = session.until else { return "On — until turned off" }
-		return "On — until \(until.formatted(date: .omitted, time: .shortened))"
+		let prefix = isOnBySchedule ? "On by schedule" : "On"
+		return "\(prefix) — until \(until.formatted(date: .omitted, time: .shortened))"
+	}
+
+	private var currentIcon: NSImage? {
+		if isOnBySchedule { return scheduledIcon }
+		return isOn ? onIcon : offIcon
 	}
 
 	private func refresh() {
-		// On: filled steaming cup. Off: the same cup in outline, without the steam. macOS 14+ has
-		// the steaming-cup symbol; older systems fall back to the cup and saucer.
-		statusItem.button?.image = isOn
-			? NSImage(systemSymbolName: "cup.and.heat.waves.fill", accessibilityDescription: "Coffee on")
-				?? NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: "Coffee on")
-			: offIcon
+		statusItem.button?.image = currentIcon
 		statusItem.button?.toolTip = statusText() + "\nClick to toggle · right-click for options"
 	}
 }
