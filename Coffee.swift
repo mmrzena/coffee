@@ -12,6 +12,8 @@ private struct Session {
 
 private enum DefaultsKey {
 	static let keepDisplayOn = "keepDisplayOn"
+	static let stayAwakeLidClosed = "stayAwakeLidClosed"
+	static let lidSleepDisabledByCoffee = "lidSleepDisabledByCoffee"
 	static let askBeforeToggling = "askBeforeToggling"
 	static let scheduleEnabled = "scheduleEnabled"
 	static let scheduleStartHour = "scheduleStartHour"
@@ -148,8 +150,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 	private var session: Session?
 	private var lastError: String?
-	private var keepDisplayOn = UserDefaults.standard.bool(forKey: DefaultsKey.keepDisplayOn)
-	private var askBeforeToggling = UserDefaults.standard.object(forKey: DefaultsKey.askBeforeToggling) as? Bool ?? true
+	private var keepDisplayOn = UserDefaults.standard.bool(forKey: DefaultsKey.keepDisplayOn) {
+		didSet { UserDefaults.standard.set(keepDisplayOn, forKey: DefaultsKey.keepDisplayOn) }
+	}
+	private var stayAwakeLidClosed = UserDefaults.standard.bool(forKey: DefaultsKey.stayAwakeLidClosed) {
+		didSet { UserDefaults.standard.set(stayAwakeLidClosed, forKey: DefaultsKey.stayAwakeLidClosed) }
+	}
+	/// Whether Coffee turned on the system-wide `pmset disablesleep`; persisted so a crash gets
+	/// cleaned up on next launch, and so Coffee never undoes a setting someone else made.
+	private var lidSleepDisabledByCoffee = UserDefaults.standard.bool(forKey: DefaultsKey.lidSleepDisabledByCoffee) {
+		didSet { UserDefaults.standard.set(lidSleepDisabledByCoffee, forKey: DefaultsKey.lidSleepDisabledByCoffee) }
+	}
+	private var lidRestoreFailureReported = false
+	private var askBeforeToggling = UserDefaults.standard.object(forKey: DefaultsKey.askBeforeToggling) as? Bool ?? true {
+		didSet { UserDefaults.standard.set(askBeforeToggling, forKey: DefaultsKey.askBeforeToggling) }
+	}
 	private var schedule = Schedule.load()
 	private var scheduleTimer: Timer?
 	/// End of the scheduled window the user turned off by hand; the schedule leaves that window alone.
@@ -166,6 +181,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		guard let end = currentWindow?.end else { return false }
 		return end == dismissedWindowEnd
 	}
+	/// Within scheduled hours, but the schedule isn't what's in charge: the user skipped this
+	/// window, or picked a manual session (e.g. "Turn On") that overrides it. Shown as a mixed checkmark.
+	private var isScheduleSidelined: Bool {
+		guard currentWindow != nil else { return false }
+		return isSkippingCurrentWindow || (isOn && !isOnBySchedule)
+	}
 
 	func applicationDidFinishLaunching(_ notification: Notification) {
 		if let button = statusItem.button {
@@ -180,6 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			NotificationCenter.default.addObserver(self, selector: #selector(recheckClock), name: name, object: nil)
 		}
 		applySchedule()
+		syncLidSleep() // clears a setting a crashed run left on, unless the schedule just turned Coffee on
 		refresh()
 	}
 
@@ -246,6 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		}
 		menu.addItem(.separator())
 		menu.addItem(menuItem("Keep Display On", #selector(toggleKeepDisplayOn), checked: keepDisplayOn))
+		menu.addItem(menuItem("Stay Awake With Lid Closed", #selector(toggleStayAwakeLidClosed), checked: stayAwakeLidClosed))
 		menu.addItem(scheduleMenuItem())
 		menu.addItem(menuItem("Ask Before Toggling", #selector(toggleAskBeforeToggling), checked: askBeforeToggling))
 		menu.addItem(.separator())
@@ -255,16 +278,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 	private func scheduleMenuItem() -> NSMenuItem {
 		let hours = "\(hourLabel(schedule.startHour))–\(hourLabel(schedule.endHour))"
+		let sidelined = isScheduleSidelined
 		let title: String
 		if !schedule.isEnabled {
 			title = "Schedule: Off"
 		} else if isSkippingCurrentWindow {
 			title = "Schedule: \(hours) (skipped today)"
+		} else if sidelined {
+			title = "Schedule: \(hours) (overridden)"
 		} else {
 			title = "Schedule: \(hours)"
 		}
 		let submenu = NSMenu()
-		submenu.addItem(menuItem("On \(hours)", #selector(toggleSchedule), checked: schedule.isEnabled))
+		let toggle = menuItem("On \(hours)", #selector(toggleSchedule))
+		toggle.state = sidelined ? .mixed : schedule.isEnabled ? .on : .off
+		submenu.addItem(toggle)
 		submenu.addItem(menuItem("Weekdays Only", #selector(toggleScheduleWeekdaysOnly), checked: schedule.weekdaysOnly))
 		submenu.addItem(.separator())
 		submenu.addItem(hourPicker("Start", selected: schedule.startHour,
@@ -314,16 +342,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 	@objc private func toggleKeepDisplayOn() {
 		keepDisplayOn.toggle()
-		UserDefaults.standard.set(keepDisplayOn, forKey: DefaultsKey.keepDisplayOn)
 		if let session { turnOn(until: session.until) } // re-assert with the new type, same end time
 	}
 
-	@objc private func toggleAskBeforeToggling() {
-		askBeforeToggling.toggle()
-		UserDefaults.standard.set(askBeforeToggling, forKey: DefaultsKey.askBeforeToggling)
+	@objc private func toggleStayAwakeLidClosed() {
+		stayAwakeLidClosed.toggle()
+		lastError = nil
+		syncLidSleep()
+		refresh()
 	}
 
-	@objc private func toggleSchedule() { updateSchedule { $0.isEnabled.toggle() } }
+	/// Power assertions don't stop lid-close sleep; only the system-wide `pmset disablesleep` does,
+	/// and it needs root (via the sudoers rule from setup-lid.sh). Held only while Coffee is on.
+	private func syncLidSleep() {
+		let want = isOn && stayAwakeLidClosed
+		guard want != lidSleepDisabledByCoffee else { return }
+		switch (want, systemSleepDisabled()) {
+		case (true, .some(true)): return // already set by someone else; leave it theirs to undo
+		case (false, .some(false)): lidSleepDisabledByCoffee = false; return // someone already cleared it
+		default: break
+		}
+		if setSystemSleepDisabled(want) {
+			lidSleepDisabledByCoffee = want
+			lidRestoreFailureReported = false
+		} else if want {
+			stayAwakeLidClosed = false // so later turn-ons, e.g. the schedule's, don't retry and beep
+			fail("Lid-closed mode needs setup: run setup-lid.sh")
+		} else {
+			// Retried on every turn-off and launch until it works, but only beeps the first time.
+			lastError = "Couldn't restore lid sleep: run sudo pmset -a disablesleep 0"
+			if !lidRestoreFailureReported { NSSound.beep() }
+			lidRestoreFailureReported = true
+		}
+	}
+
+	/// The live `disablesleep` value from the power manager, or nil if it can't be read.
+	private func systemSleepDisabled() -> Bool? {
+		let rootDomain = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+		guard rootDomain != 0 else { return nil }
+		defer { IOObjectRelease(rootDomain) }
+		return IORegistryEntryCreateCFProperty(rootDomain, "SleepDisabled" as CFString, kCFAllocatorDefault, 0)?
+			.takeRetainedValue() as? Bool
+	}
+
+	/// The arguments must match the sudoers rule in setup-lid.sh exactly, or sudo wants a password.
+	private func setSystemSleepDisabled(_ disabled: Bool) -> Bool {
+		let sudo = Process()
+		sudo.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+		sudo.arguments = ["-n", "/usr/bin/pmset", "-a", "disablesleep", disabled ? "1" : "0"]
+		sudo.standardError = FileHandle.nullDevice
+		let exited = DispatchSemaphore(value: 0)
+		sudo.terminationHandler = { _ in exited.signal() }
+		do { try sudo.run() } catch { return false }
+		// A semaphore, not waitUntilExit(): that spins the run loop, letting timers re-enter
+		// turnOn/turnOff mid-call. The timeout keeps a stalled sudo from freezing the menu bar.
+		guard exited.wait(timeout: .now() + 5) == .success else {
+			sudo.terminate()
+			return false
+		}
+		return sudo.terminationStatus == 0
+	}
+
+	private func fail(_ message: String) {
+		lastError = message
+		NSSound.beep()
+		refresh()
+	}
+
+	@objc private func toggleAskBeforeToggling() { askBeforeToggling.toggle() }
+
+	/// When the schedule is set but sidelined, clicking it hands control back to it instead of
+	/// disabling it; otherwise it switches the schedule on or off.
+	@objc private func toggleSchedule() {
+		if isScheduleSidelined { userTurnOn() } else { updateSchedule { $0.isEnabled.toggle() } }
+	}
 	@objc private func toggleScheduleWeekdaysOnly() { updateSchedule { $0.weekdaysOnly.toggle() } }
 	@objc private func setScheduleStart(_ sender: NSMenuItem) { updateSchedule { $0.startHour = sender.tag } }
 	@objc private func setScheduleEnd(_ sender: NSMenuItem) { updateSchedule { $0.endHour = sender.tag } }
@@ -374,7 +466,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	}
 
 	@objc private func recheckClock() {
-		if let until = session?.until, until <= Date() { turnOff() }
+		if let until = session?.until, until <= Date() { sessionEnded() } else { applySchedule() }
+	}
+
+	/// A session that ran out hands straight over to the schedule when within its hours, rather
+	/// than turning off first, which would briefly re-enable lid sleep with the lid maybe closed.
+	private func sessionEnded() {
+		if let window = currentWindow, !isSkippingCurrentWindow { turnOn(until: window.end) } else { turnOff() }
 		applySchedule()
 	}
 
@@ -388,30 +486,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		let result = IOPMAssertionCreateWithName(type, IOPMAssertionLevel(kIOPMAssertionLevelOn),
 			"Coffee menu-bar toggle" as CFString, &assertionID)
 		guard result == kIOReturnSuccess else {
-			lastError = "Couldn't keep the Mac awake (IOKit error \(result))"
-			NSSound.beep()
-			refresh()
-			return
+			return fail("Couldn't keep the Mac awake (IOKit error \(result))")
 		}
 
 		var timer: Timer?
 		if let until {
-			timer = oneShotTimer(at: until) { [weak self] in
-				self?.turnOff()
-				self?.applySchedule() // a short session ending inside scheduled hours hands back to the schedule
-			}
+			timer = oneShotTimer(at: until) { [weak self] in self?.sessionEnded() }
 		}
 
 		// New assertion exists before the old one is released, so there's no gap with nothing held.
 		endSession()
 		session = Session(assertionID: assertionID, until: until, timer: timer)
 		lastError = nil
+		syncLidSleep()
 		refresh()
 	}
 
 	@objc private func turnOff() {
 		endSession()
 		lastError = nil
+		syncLidSleep()
 		refresh()
 	}
 
