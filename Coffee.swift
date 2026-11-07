@@ -18,24 +18,22 @@ private enum DefaultsKey {
 	static let scheduleEnabled = "scheduleEnabled"
 	static let scheduleStartHour = "scheduleStartHour"
 	static let scheduleEndHour = "scheduleEndHour"
-	static let scheduleWeekdaysOnly = "scheduleWeekdaysOnly"
 }
 
-/// Daily keep-awake hours, e.g. 9:00–17:00 on weekdays. Windows start and end on whole hours
+/// Daily keep-awake hours, e.g. 9:00–17:00 every day. Windows start and end on whole hours
 /// within one day (startHour < endHour).
 private struct Schedule {
 	var isEnabled: Bool
 	var startHour: Int
 	var endHour: Int
-	var weekdaysOnly: Bool
 
 	static func load() -> Schedule {
 		let defaults = UserDefaults.standard
+		defaults.removeObject(forKey: "scheduleWeekdaysOnly") // from the removed Weekdays Only option
 		return Schedule(
 			isEnabled: defaults.bool(forKey: DefaultsKey.scheduleEnabled),
 			startHour: defaults.object(forKey: DefaultsKey.scheduleStartHour) as? Int ?? 9,
-			endHour: defaults.object(forKey: DefaultsKey.scheduleEndHour) as? Int ?? 17,
-			weekdaysOnly: defaults.object(forKey: DefaultsKey.scheduleWeekdaysOnly) as? Bool ?? true)
+			endHour: defaults.object(forKey: DefaultsKey.scheduleEndHour) as? Int ?? 17)
 	}
 
 	func save() {
@@ -43,12 +41,13 @@ private struct Schedule {
 		defaults.set(isEnabled, forKey: DefaultsKey.scheduleEnabled)
 		defaults.set(startHour, forKey: DefaultsKey.scheduleStartHour)
 		defaults.set(endHour, forKey: DefaultsKey.scheduleEndHour)
-		defaults.set(weekdaysOnly, forKey: DefaultsKey.scheduleWeekdaysOnly)
 	}
 
-	/// The scheduled window on the day containing `date`, or nil if that day isn't scheduled.
+	/// The daily hours as text, e.g. "9:00–17:00".
+	var windowLabel: String { "\(hourLabel(startHour))–\(hourLabel(endHour))" }
+
+	/// The scheduled window on the day containing `date`, or nil if the hours don't form a valid window.
 	private func window(onDayOf date: Date, calendar: Calendar) -> DateInterval? {
-		if weekdaysOnly && calendar.isDateInWeekend(date) { return nil }
 		guard let start = calendar.date(bySettingHour: startHour, minute: 0, second: 0, of: date),
 			let end = calendar.date(bySettingHour: endHour, minute: 0, second: 0, of: date),
 			start < end
@@ -67,13 +66,10 @@ private struct Schedule {
 	func nextStart(after now: Date) -> Date? {
 		guard isEnabled else { return nil }
 		let calendar = Calendar.current
-		for dayOffset in 0...7 {
-			if let day = calendar.date(byAdding: .day, value: dayOffset, to: now),
-				let window = window(onDayOf: day, calendar: calendar), window.start > now {
-				return window.start
-			}
-		}
-		return nil
+		// Every day is scheduled, so the next start is today's, or else tomorrow's.
+		guard let today = window(onDayOf: now, calendar: calendar) else { return nil }
+		if today.start > now { return today.start }
+		return calendar.date(byAdding: .day, value: 1, to: today.start)
 	}
 }
 
@@ -121,12 +117,12 @@ private let offIcon = makeCupWithoutSteam()
 private let onIcon = NSImage(systemSymbolName: "cup.and.heat.waves.fill", accessibilityDescription: "Coffee on")
 	?? NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: "Coffee on")
 
-/// The "on" cup with a small clock in the bottom-right corner, shown while the schedule holds
-/// Coffee on. A ring around the clock is punched out of the cup so the badge reads at menu-bar size.
-private func makeScheduledIcon() -> NSImage? {
-	guard let cup = onIcon,
+/// `cup` with a small clock in the bottom-right corner, marking the schedule as enabled. A ring
+/// around the clock is punched out of the cup so the badge reads at menu-bar size.
+private func withClockBadge(_ cup: NSImage?, description: String) -> NSImage? {
+	guard let cup,
 		let clock = NSImage(systemSymbolName: "clock.fill", accessibilityDescription: nil)
-	else { return nil }
+	else { return cup }
 	let image = NSImage(size: cup.size, flipped: false) { rect in
 		cup.draw(in: rect)
 		let side = rect.height * 0.6
@@ -140,11 +136,12 @@ private func makeScheduledIcon() -> NSImage? {
 	}
 	image.isTemplate = true
 	image.alignmentRect = cup.alignmentRect
-	image.accessibilityDescription = "Coffee on by schedule"
+	image.accessibilityDescription = description
 	return image
 }
 
-private let scheduledIcon = makeScheduledIcon() ?? onIcon
+private let onScheduleArmedIcon = withClockBadge(onIcon, description: "Coffee on, schedule on")
+private let offScheduleArmedIcon = withClockBadge(offIcon, description: "Coffee off, schedule on")
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 	private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -177,12 +174,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		return until == currentWindow?.end
 	}
 	private var currentWindow: DateInterval? { schedule.activeWindow(at: Date()) }
+	/// Enabled and not skipping today: the schedule will keep Coffee on through its next hours.
+	private var isScheduleArmed: Bool { schedule.isEnabled && !isSkippingCurrentWindow }
 	private var isSkippingCurrentWindow: Bool {
 		guard let end = currentWindow?.end else { return false }
 		return end == dismissedWindowEnd
 	}
 	/// Within scheduled hours, but the schedule isn't what's in charge: the user skipped this
-	/// window, or picked a manual session (e.g. "Turn On") that overrides it. Shown as a mixed checkmark.
+	/// window, or picked a timed session (e.g. "On for 1 hour") that overrides it. Shown as a mixed checkmark.
 	private var isScheduleSidelined: Bool {
 		guard currentWindow != nil else { return false }
 		return isSkippingCurrentWindow || (isOn && !isOnBySchedule)
@@ -215,7 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		} else if askBeforeToggling {
 			showMenu(buildConfirmMenu())
 		} else {
-			isOn ? userTurnOff() : userTurnOn()
+			isOn ? userTurnOff() : turnOnManually()
 		}
 	}
 
@@ -233,19 +232,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 			menu.addItem(menuItem("Turn Off", #selector(userTurnOff)))
 		} else {
 			menu.addItem(menuItem("Turn On", #selector(confirmTurnOn)))
-			if !schedule.isEnabled || isSkippingCurrentWindow {
-				menu.addItem(menuItem("Turn On Schedule", #selector(confirmTurnOnSchedule)))
+			// Off while the schedule waits for its hours: turning it "on" would do nothing.
+			if isScheduleArmed {
+				menu.addItem(menuItem("Turn Off Schedule", #selector(confirmTurnOffSchedule)))
+			} else {
+				menu.addItem(menuItem("Turn On Schedule (\(schedule.windowLabel))", #selector(confirmTurnOnSchedule)))
 			}
 		}
 		return menu
 	}
 
-	// Timers keep running while the menu is open, so act on what was offered, not a fresh toggle.
+	// Timers keep running while the menu is open, so the confirm handlers act on what was
+	// offered, not a fresh toggle.
+
 	@objc private func confirmTurnOn() {
 		guard !isOn else { return }
-		dismissedWindowEnd = nil
-		turnOn(until: nil)
+		turnOnManually()
 	}
+
+	@objc private func confirmTurnOffSchedule() { updateSchedule { $0.isEnabled = false } }
 
 	/// Enables the schedule, or stops skipping today's window; Coffee comes on now if it's within hours.
 	@objc private func confirmTurnOnSchedule() {
@@ -262,7 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		if isOn {
 			menu.addItem(menuItem("Turn Off", #selector(userTurnOff)))
 		}
-		menu.addItem(menuItem("On Indefinitely", #selector(turnOnIndefinitely)))
+		menu.addItem(menuItem("On Indefinitely", #selector(turnOnManually)))
 		for option in durationOptions {
 			menu.addItem(menuItem(option.label, #selector(turnOnForDuration(_:)), tag: option.minutes))
 		}
@@ -277,7 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	}
 
 	private func scheduleMenuItem() -> NSMenuItem {
-		let hours = "\(hourLabel(schedule.startHour))–\(hourLabel(schedule.endHour))"
+		let hours = schedule.windowLabel
 		let sidelined = isScheduleSidelined
 		let title: String
 		if !schedule.isEnabled {
@@ -293,7 +298,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		let toggle = menuItem("On \(hours)", #selector(toggleSchedule))
 		toggle.state = sidelined ? .mixed : schedule.isEnabled ? .on : .off
 		submenu.addItem(toggle)
-		submenu.addItem(menuItem("Weekdays Only", #selector(toggleScheduleWeekdaysOnly), checked: schedule.weekdaysOnly))
 		submenu.addItem(.separator())
 		submenu.addItem(hourPicker("Start", selected: schedule.startHour,
 			enabled: 0...(schedule.endHour - 1), action: #selector(setScheduleStart(_:))))
@@ -334,7 +338,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 		return timer
 	}
 
-	@objc private func turnOnIndefinitely() { turnOn(until: nil) }
+	/// "On until turned off" (Turn On, a plain click, On Indefinitely) is manual mode: it switches
+	/// the schedule off so it can't take over. Turning on first, so `updateSchedule` doesn't end a
+	/// session the schedule started and leave a gap with nothing held.
+	@objc private func turnOnManually() {
+		turnOn(until: nil)
+		updateSchedule { $0.isEnabled = false }
+	}
 	@objc private func turnOnForDuration(_ sender: NSMenuItem) {
 		turnOn(until: Date().addingTimeInterval(TimeInterval(sender.tag * 60)))
 	}
@@ -416,7 +426,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	@objc private func toggleSchedule() {
 		if isScheduleSidelined { userTurnOn() } else { updateSchedule { $0.isEnabled.toggle() } }
 	}
-	@objc private func toggleScheduleWeekdaysOnly() { updateSchedule { $0.weekdaysOnly.toggle() } }
 	@objc private func setScheduleStart(_ sender: NSMenuItem) { updateSchedule { $0.startHour = sender.tag } }
 	@objc private func setScheduleEnd(_ sender: NSMenuItem) { updateSchedule { $0.endHour = sender.tag } }
 
@@ -528,8 +537,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 	}
 
 	private var currentIcon: NSImage? {
-		if isOnBySchedule { return scheduledIcon }
-		return isOn ? onIcon : offIcon
+		// The cup says whether Coffee is on; the clock says the schedule will keep it on in its hours.
+		if isOn { return isScheduleArmed ? onScheduleArmedIcon : onIcon }
+		return isScheduleArmed ? offScheduleArmedIcon : offIcon
 	}
 
 	private func refresh() {
